@@ -79,9 +79,20 @@ CREATE TABLE shipments (
                                           'customs'
                                       )),
 
+    -- Filled in by the ETL. Stored rather than worked out at query time
+    -- because nearly every report filters on them. Both are NULL while a
+    -- shipment is still in transit. days_late goes negative for early
+    -- deliveries, so on_time is days_late <= 0, not days_late == 0.
+    days_late               INTEGER,
+    on_time                 INTEGER
+                            CHECK (on_time IN (0, 1)),
+
     -- nothing arrives before it ships
     CHECK (expected_delivery_date >= ship_date),
-    CHECK (actual_delivery_date IS NULL OR actual_delivery_date >= ship_date)
+    CHECK (actual_delivery_date IS NULL OR actual_delivery_date >= ship_date),
+
+    -- both derived columns are known, or neither is
+    CHECK ((days_late IS NULL) = (on_time IS NULL))
 );
 
 
