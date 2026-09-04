@@ -1,0 +1,16 @@
+# Virtual environment
+venv/
+
+# Python
+__pycache__/
+
+# Databases
+*.db
+*.sqlite
+
+# OS
+.DS_Store
+
+# Raw data (folder is tracked, contents are not)
+data/raw/*
+!data/raw/.gitkeep
