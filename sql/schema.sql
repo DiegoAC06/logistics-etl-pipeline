@@ -95,7 +95,6 @@ CREATE TABLE shipments (
     CHECK ((days_late IS NULL) = (on_time IS NULL))
 );
 
-
 -- SQLite won't index foreign keys for you, and these are joined constantly.
 CREATE INDEX idx_orders_warehouse_id   ON orders    (warehouse_id);
 CREATE INDEX idx_shipments_order_id    ON shipments (order_id);
