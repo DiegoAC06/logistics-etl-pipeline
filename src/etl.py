@@ -43,9 +43,21 @@ TEXT_COLUMNS = {
     "shipments": ["carrier"],
 }
 
+NUMERIC_COLUMNS = {
+    "warehouses": ["warehouse_id"],
+    "orders": ["order_id", "warehouse_id", "customer_id", "quantity"],
+    "shipments": ["shipment_id", "order_id"],
+}
+
 DATE_COLUMNS = {
     "orders": ["order_date"],
     "shipments": ["ship_date", "expected_delivery_date", "actual_delivery_date"],
+}
+
+FILL_VALUES = {
+    "warehouses": {},
+    "orders": {"product_category": "Unknown", "customer_id": 0},
+    "shipments": {"carrier": "Unknown"},
 }
 
 # The four formats actually present in the raw files, confirmed by counting
@@ -122,7 +134,18 @@ def extract():
 
 # ==========================================================================
 # TRANSFORM
+#
+# Step order matters. Everything that can change a value runs before
+# drop_duplicates, because dedup compares whole rows: two rows that mean
+# the same thing only match once they look the same. Anything that removes
+# rows runs after, so the counts below stay readable.
 # ==========================================================================
+
+def log_step(table, label, before, after):
+    delta = after - before
+    log.info("  %-11s %-26s %5d -> %-5d %s", table, label, before, after,
+             f"({delta:+d})" if delta else "")
+
 
 def parse_dates(series, label):
     """
@@ -153,14 +176,62 @@ def parse_dates(series, label):
     blank = int(raw.isna().sum())
     failed = int((raw.notna() & parsed.isna()).sum())
 
-    log.info("  %-32s %s", label,
-             "  ".join(f"{f}={n}" for f, n in hits.items()) or "(none parsed)")
+    log.debug("    %-30s %s", label,
+              "  ".join(f"{f}={n}" for f, n in hits.items()) or "(none parsed)")
     if blank:
-        log.info("  %-32s %d blank", "", blank)
+        log.debug("    %-30s %d blank", label, blank)
     if failed:
-        log.warning("  %-32s %d FAILED TO PARSE -> NaT", label, failed)
+        log.warning("    %-30s %d FAILED TO PARSE -> NaT", label, failed)
 
     return parsed, failed
+
+
+def parse_date_columns(df, table):
+    """Turn every date column into real datetimes. Normalizes format, so it
+    must run before dedup -- '03/19/2026' and '2026-03-19' are the same day
+    but different strings."""
+    out = df.copy()
+    failed = 0
+    for col in DATE_COLUMNS.get(table, []):
+        out[col], n = parse_dates(out[col], f"{table}.{col}")
+        failed += n
+    return out, failed
+
+
+def normalize_text(df, table):
+    """
+    Trim, collapse internal runs of whitespace and tabs, and fold case.
+
+    This is the step the dedup depends on: ' FEDEX' and 'FedEx ' are one
+    carrier, and rows differing only by that should collapse together.
+    """
+    out = df.copy()
+    for col in TEXT_COLUMNS[table]:
+        out[col] = (out[col].str.replace(r"\s+", " ", regex=True)
+                            .str.strip()
+                            .str.title())
+    if table == "shipments":
+        # A fixed vocabulary the schema checks against, so lowercase rather
+        # than title case.
+        out["delay_reason"] = (out["delay_reason"]
+                               .str.replace(r"\s+", " ", regex=True)
+                               .str.strip().str.lower())
+    return out
+
+
+def coerce_numerics(df, table):
+    """'0007' and '7' are the same id; make them the same value."""
+    out = df.copy()
+    for col in NUMERIC_COLUMNS[table]:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+    return out
+
+
+def fill_missing(df, table):
+    out = df.copy()
+    for col, value in FILL_VALUES[table].items():
+        out[col] = out[col].fillna(value)
+    return out
 
 
 def validate_dates(frames, rejects):
@@ -170,17 +241,18 @@ def validate_dates(frames, rejects):
     Two rules: a required date that didn't parse, and a delivery that
     happened before its own shipment.
     """
-    log.info("  -- date validation --")
     orders = frames["orders"]
     shipments = frames["shipments"]
 
     for name, df in (("orders", orders), ("shipments", shipments)):
+        before = len(df)
         missing = df[REQUIRED_DATES[name]].isna().any(axis=1)
         if missing.any():
             which = df.loc[missing, REQUIRED_DATES[name]].isna().apply(
                 lambda r: "NaT: " + ", ".join(r.index[r]), axis=1)
             rejects.add(name, df[missing], "required date missing or unparseable", which)
             df = df[~missing].copy()
+        log_step(name, "reject unparseable dates", before, len(df))
         if name == "orders":
             orders = df
         else:
@@ -189,6 +261,7 @@ def validate_dates(frames, rejects):
     # A parcel cannot arrive before it was shipped. The schema rejects these
     # too, so catching them here is the difference between a reject row with
     # a reason and an aborted transaction.
+    before = len(shipments)
     impossible = (shipments["actual_delivery_date"].notna()
                   & (shipments["actual_delivery_date"] < shipments["ship_date"]))
     if impossible.any():
@@ -199,9 +272,8 @@ def validate_dates(frames, rejects):
         rejects.add("shipments", shipments[impossible],
                     "actual_delivery_date before ship_date", detail)
         shipments = shipments[~impossible].copy()
+    log_step("shipments", "reject impossible timeline", before, len(shipments))
 
-    log.info("  after date validation: %d orders, %d shipments",
-             len(orders), len(shipments))
     frames["orders"] = orders
     frames["shipments"] = shipments
     return frames
@@ -209,46 +281,40 @@ def validate_dates(frames, rejects):
 
 def transform(frames, rejects):
     log.info("TRANSFORM")
-
     total_failed = 0
-    for name, df in frames.items():
-        for col in DATE_COLUMNS.get(name, []):
-            df[col], failed = parse_dates(df[col], f"{name}.{col}")
-            total_failed += failed
+
+    for name in LOAD_ORDER:
+        df = frames[name]
+        log.info("  -- %s --", name)
+
+        # --- value-shaping steps: all of these must precede dedup ---
+        before = len(df)
+        df, failed = parse_date_columns(df, name)
+        total_failed += failed
+        log_step(name, "parse dates", before, len(df))
 
         before = len(df)
-        df = df.drop_duplicates()
-        log.info("  %-12s dropped %d duplicate rows -> %d",
-                 name, before - len(df), len(df))
+        df = normalize_text(df, name)
+        log_step(name, "normalize text", before, len(df))
 
-        for col in TEXT_COLUMNS[name]:
-            df[col] = df[col].str.strip().str.title()
+        before = len(df)
+        df = coerce_numerics(df, name)
+        log_step(name, "coerce numerics", before, len(df))
+
+        before = len(df)
+        df = fill_missing(df, name)
+        log_step(name, "fill missing values", before, len(df))
+
+        # --- row-removing steps: only now that values are final ---
+        before = len(df)
+        df = df.drop_duplicates()
+        log_step(name, "drop duplicate rows", before, len(df))
 
         frames[name] = df
 
     log.info("  %d date values failed to parse across all columns", total_failed)
 
-    orders = frames["orders"]
-    shipments = frames["shipments"]
-
-    for col in ("warehouse_id", "customer_id", "quantity"):
-        orders[col] = pd.to_numeric(orders[col], errors="coerce")
-    orders["order_id"] = pd.to_numeric(orders["order_id"], errors="coerce")
-    for col in ("shipment_id", "order_id"):
-        shipments[col] = pd.to_numeric(shipments[col], errors="coerce")
-    frames["warehouses"]["warehouse_id"] = pd.to_numeric(
-        frames["warehouses"]["warehouse_id"], errors="coerce")
-
-    # delay_reason is a fixed vocabulary the schema checks against, so it
-    # gets lowercased rather than title-cased.
-    shipments["delay_reason"] = shipments["delay_reason"].str.strip().str.lower()
-
-    # Fill in what's missing.
-    orders["product_category"] = orders["product_category"].fillna("Unknown")
-    orders["customer_id"] = orders["customer_id"].fillna(0)
-    shipments["carrier"] = shipments["carrier"].fillna("Unknown")
-    log.info("  filled missing product_category, customer_id and carrier")
-
+    log.info("  -- validation --")
     frames = validate_dates(frames, rejects)
     shipments = frames["shipments"]
 
@@ -260,13 +326,10 @@ def transform(frames, rejects):
             - shipments["expected_delivery_date"]).dt.days
     shipments["days_late"] = days
     shipments["on_time"] = (days <= 0).astype("boolean").where(days.notna(), pd.NA)
-    log.info("  added days_late and on_time (%d early, %d on the day, %d late, "
-             "%d in transit)",
+    log.info("  derived days_late/on_time: %d early, %d on the day, %d late, "
+             "%d in transit",
              int((days < 0).sum()), int((days == 0).sum()),
              int((days > 0).sum()), int(days.isna().sum()))
-
-    for name, df in frames.items():
-        log.info("  %-12s %5d rows after transform", name, len(df))
 
     return frames
 
@@ -357,17 +420,21 @@ def load(frames, rejects):
 
     # Bulk inserts abort as a whole, with no way to tell which row was bad.
     # Find the orphans here, where the offending value can still be named.
+    before = len(orders)
     orders, bad_orders = split_on_fk(
         orders, "warehouse_id", set(warehouses["warehouse_id"]))
     rejects.add("orders", bad_orders, "warehouse_id not found in warehouses",
                 "warehouse_id=" + bad_orders["warehouse_id"].astype(str))
+    log_step("orders", "reject orphan warehouse_id", before, len(orders))
 
     # Checked against the orders that survived, not the ones we started with
     # -- a shipment whose order was rejected for any reason is orphaned too.
+    before = len(shipments)
     shipments, bad_shipments = split_on_fk(
         shipments, "order_id", set(orders["order_id"]))
     rejects.add("shipments", bad_shipments, "order_id not found in orders",
                 "order_id=" + bad_shipments["order_id"].astype(str))
+    log_step("shipments", "reject orphan order_id", before, len(shipments))
 
     rejects.write()
 
@@ -377,8 +444,8 @@ def load(frames, rejects):
     try:
         ensure_schema(conn)
 
-        before = row_counts(conn)
-        log.info("  rows before load:  %s", fmt_counts(before))
+        before_counts = row_counts(conn)
+        log.info("  rows before load:  %s", fmt_counts(before_counts))
 
         # One transaction around the whole clear-and-reload. A failure
         # anywhere rolls back to the previous contents rather than leaving
@@ -400,8 +467,7 @@ def load(frames, rejects):
             log.error("  load failed and was rolled back; database unchanged")
             raise
 
-        after = row_counts(conn)
-        log.info("  rows after load:   %s", fmt_counts(after))
+        log.info("  rows after load:   %s", fmt_counts(row_counts(conn)))
 
         violations = conn.execute("PRAGMA foreign_key_check").fetchall()
         if violations:
