@@ -38,12 +38,30 @@ log = logging.getLogger("etl")
 # Parents first. Deletes walk this backwards.
 LOAD_ORDER = ("warehouses", "orders", "shipments")
 
-# Columns where title case is the right rule -- ordinary words. Carrier and
-# delay_reason are handled separately below, because they aren't words.
-TEXT_COLUMNS = {
-    "warehouses": ["name", "region", "city", "state"],
-    "orders": ["product_category"],
-    "shipments": [],
+# Casing is a per-column decision, not a per-table one. 'AZ' is a code,
+# 'Newark DC' is a name, 'home_goods' is a key and 'Northeast' is a word --
+# one .str.title() over all four mangles three of them.
+#
+#   asis   trim only, leave the characters alone
+#   title  ordinary words
+#   upper  short codes
+#   lower  controlled vocabularies and keys
+#
+# carrier isn't here: no casing rule produces UPS, FedEx and OnTrac, so it
+# goes through CARRIER_NAMES instead.
+TEXT_RULES = {
+    "warehouses": {
+        "name": "asis",     # proper nouns from the source; "DC" is not "Dc"
+        "region": "title",  # words, and the source really does hold 'NORTHEAST'
+        "city": "title",
+        "state": "upper",   # two-letter postal codes
+    },
+    "orders": {
+        "product_category": "lower",   # 'home_goods' is a key, not a label
+    },
+    "shipments": {
+        "delay_reason": "lower",       # the schema's CHECK expects lowercase
+    },
 }
 
 # Carrier names are brands, not sentences: .str.title() turns UPS into 'Ups'
@@ -74,12 +92,16 @@ DATE_COLUMNS = {
 # shipment -- but they are NOT anonymous customers, so filter customer_id
 # on this value before counting distinct customers.
 UNKNOWN_CUSTOMER_ID = 0
-UNKNOWN_TEXT = "Unknown"
+# Each sentinel matches its own column's convention: carriers are brand
+# names, categories are lowercase keys.
+UNKNOWN_CARRIER = "Unknown"
+UNKNOWN_CATEGORY = "unknown"
 
 FILL_VALUES = {
     "warehouses": {},
-    "orders": {"product_category": UNKNOWN_TEXT, "customer_id": UNKNOWN_CUSTOMER_ID},
-    "shipments": {"carrier": UNKNOWN_TEXT},
+    "orders": {"product_category": UNKNOWN_CATEGORY,
+               "customer_id": UNKNOWN_CUSTOMER_ID},
+    "shipments": {"carrier": UNKNOWN_CARRIER},
 }
 
 # Not in FILL_VALUES: this one depends on on_time, which doesn't exist until
@@ -259,19 +281,24 @@ def normalize_text(df, table):
     This is the step the dedup depends on: ' FEDEX' and 'FedEx ' are one
     carrier, and rows differing only by that should collapse together.
 
-    Casing is per column, not per table. Ordinary words get title case;
-    carrier gets a brand lookup; delay_reason gets lowercased to match the
-    schema's CHECK. Nothing runs after these, so nothing re-mangles them.
+    Casing follows TEXT_RULES, one rule per column; carrier gets the brand
+    lookup. Nothing runs after these, so nothing re-mangles them.
     """
     out = df.copy()
-    for col in TEXT_COLUMNS[table]:
-        out[col] = tidy(out[col]).str.title()
+    for col, rule in TEXT_RULES[table].items():
+        cleaned = tidy(out[col])
+        if rule == "title":
+            cleaned = cleaned.str.title()
+        elif rule == "upper":
+            cleaned = cleaned.str.upper()
+        elif rule == "lower":
+            cleaned = cleaned.str.lower()
+        elif rule != "asis":
+            raise ValueError(f"unknown casing rule {rule!r} for {table}.{col}")
+        out[col] = cleaned
 
     if table == "shipments":
         out["carrier"] = canonical_carrier(out["carrier"])
-        # A fixed vocabulary the schema checks against, so lowercase rather
-        # than title case.
-        out["delay_reason"] = tidy(out["delay_reason"]).str.lower()
     return out
 
 

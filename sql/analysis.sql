@@ -10,7 +10,11 @@
          on the day     3179   days_late = 0
          late           1009   days_late > 0
        in transit         55   days_late IS NULL -- not late, just not here yet
-     with a delay_reason 983   so 26 late shipments have no recorded cause
+     with a delay_reason 1009  every late shipment has one; 26 say 'unknown'
+     carrier 'Unknown'    36   blank at source, not a real carrier
+
+   Query 4 keeps the 'Unknown' carrier so its totals add up, and pins it
+   last rather than ranking it. Query 6 drops it. Each says which and why.
 
    Averaging days_late over everything delivered gives 0.48; over the late
    ones only it's 3.09. Both are true and they answer different questions,
@@ -136,7 +140,7 @@ ORDER BY occurrences DESC, warehouse;
 
 -- name: carrier_ranking
 -- title: Carrier performance ranking
--- question: Which carriers earn their money? delivered, on_time_pct and avg_net_days are over that carrier's delivered shipments; avg_when_late is over its late ones only. The gap between the two averages is how concentrated the pain is.
+-- question: Which carriers earn their money? delivered, on_time_pct and avg_net_days are over that carrier's delivered shipments; avg_when_late is over its late ones only. The gap between the two averages is how concentrated the pain is. RECONCILES: delivered sums to every delivered shipment (4,909 across the five real carriers + 36 in the 'Unknown' bucket = 4,945).
 SELECT
     s.carrier                                                     AS carrier,
     count(s.on_time)                                              AS delivered,
@@ -151,10 +155,15 @@ SELECT
 -- cannot exist in this schema. Add a carriers table and this becomes a LEFT
 -- JOIN like the others.
 FROM shipments s
-WHERE s.carrier <> 'Unknown'   -- placeholder, not a carrier
+-- 'Unknown' is NOT filtered out here, on purpose. It used to be, and the
+-- delivered column then summed to 4,909 with nothing on screen explaining
+-- the missing 36 -- a silent hole is worse than a labelled bucket. It is
+-- still not a carrier (it's shipments whose carrier was blank at source),
+-- so it's pinned to the bottom instead of being ranked among the real ones.
+-- Exclude it explicitly when comparing carriers against each other.
 GROUP BY s.carrier
 HAVING count(s.on_time) > 0
-ORDER BY on_time_pct DESC;
+ORDER BY s.carrier = 'Unknown', on_time_pct DESC;
 
 
 -- name: monthly_trend
@@ -179,7 +188,7 @@ ORDER BY month;
 
 -- name: worst_warehouse_carrier_pairs
 -- title: Worst warehouse / carrier combinations
--- question: Where should attention go first? delivered, late_pct and avg_net_days are over that pairing's delivered shipments; avg_when_late is over its late ones. Pairings under 30 delivered are dropped as too small to read.
+-- question: Where should attention go first? delivered, late_pct and avg_net_days are over that pairing's delivered shipments; avg_when_late is over its late ones. DOES NOT RECONCILE, by design: this is a worst-15 list, so HAVING and LIMIT drop most pairings, and the 'Unknown' carrier is excluded outright. Use query 4 or 1 for totals.
 SELECT
     w.name                                                        AS warehouse,
     s.carrier                                                     AS carrier,
@@ -196,6 +205,8 @@ FROM shipments s
 -- Dropping unmatched rows IS the filter.
 JOIN orders     o ON o.order_id     = s.order_id
 JOIN warehouses w ON w.warehouse_id = o.warehouse_id
+-- excluded here but NOT in query 4: a warehouse/'Unknown' pairing isn't a
+-- real relationship to rank, and this list never reconciles anyway
 WHERE s.carrier <> 'Unknown'
 GROUP BY w.warehouse_id, w.name, s.carrier
 -- below 30 delivered it's luck, not performance
