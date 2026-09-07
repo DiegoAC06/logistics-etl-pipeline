@@ -82,7 +82,7 @@ ORDER BY avg_when_late DESC;
 
 -- name: top_delay_reason_by_warehouse
 -- title: Most common delay reason per warehouse
--- question: What goes wrong most often at each site? occurrences and share_pct are over delays that have a recorded reason, NOT over all delays -- unexplained counts the late shipments nobody logged a cause for, and those are in no reason's share.
+-- question: What goes wrong most often at each site? Every late shipment carries a reason now, so occurrences and share_pct are over all of a site's late shipments and the shares sum to 100%. unknown_cause is how many of those were logged with no actual cause.
 WITH delay_counts AS (
     SELECT
         o.warehouse_id  AS warehouse_id,
@@ -96,11 +96,11 @@ WITH delay_counts AS (
     GROUP BY o.warehouse_id, s.delay_reason
 ),
 late_totals AS (
-    -- every late shipment, explained or not, so the gap is visible
+    -- every late shipment, plus how many of them say 'unknown'
     SELECT
-        o.warehouse_id                                    AS warehouse_id,
-        sum(s.days_late > 0)                              AS late_total,
-        sum(s.days_late > 0 AND s.delay_reason IS NULL)   AS unexplained
+        o.warehouse_id                        AS warehouse_id,
+        sum(s.days_late > 0)                  AS late_total,
+        sum(s.delay_reason = 'unknown')       AS unknown_cause
     FROM shipments s
     JOIN orders o ON o.order_id = s.order_id
     GROUP BY o.warehouse_id
@@ -119,12 +119,11 @@ SELECT
     coalesce(r.delay_reason, 'no delays recorded')  AS top_reason,
     coalesce(r.occurrences, 0)                      AS occurrences,
     coalesce(t.late_total, 0)                       AS late_total,
-    coalesce(r.explained, 0)                        AS explained,
-    coalesce(t.unexplained, 0)                      AS unexplained,
-    -- share of EXPLAINED delays, which is why the denominator is r.explained
-    -- and not t.late_total
+    coalesce(t.unknown_cause, 0)                    AS unknown_cause,
+    -- every late shipment has a reason now, so late_total is the honest
+    -- denominator and the shares across reasons add up to 100%
     round(100.0 * CAST(r.occurrences AS REAL)
-          / NULLIF(r.explained, 0), 1)              AS share_pct
+          / NULLIF(t.late_total, 0), 1)             AS share_pct
 FROM warehouses w
 -- OUTER: a warehouse with a clean record is a result worth seeing. Inner
 -- would silently hide the best-performing sites, which is the opposite of

@@ -67,8 +67,9 @@ CREATE TABLE shipments (
                             CHECK (actual_delivery_date IS NULL
                                    OR actual_delivery_date IS date(actual_delivery_date)),
 
-    -- null = on time, or not delivered yet. Check actual_delivery_date to
-    -- tell those apart.
+    -- null means not late: on time, or not delivered yet.
+    -- 'unknown' means late, but nobody wrote down why -- a real state the
+    -- source data has, and distinct from both of the above.
     delay_reason            TEXT
                             CHECK (delay_reason IS NULL
                                    OR delay_reason IN (
@@ -76,7 +77,8 @@ CREATE TABLE shipments (
                                           'carrier_delay',
                                           'inventory_shortage',
                                           'address_issue',
-                                          'customs'
+                                          'customs',
+                                          'unknown'
                                       )),
 
     -- Filled in by the ETL. Stored rather than worked out at query time

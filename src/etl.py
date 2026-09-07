@@ -15,6 +15,7 @@ rather than being dropped quietly.
     python src\\etl.py
 """
 
+import hashlib
 import logging
 import sqlite3
 from pathlib import Path
@@ -37,10 +38,23 @@ log = logging.getLogger("etl")
 # Parents first. Deletes walk this backwards.
 LOAD_ORDER = ("warehouses", "orders", "shipments")
 
+# Columns where title case is the right rule -- ordinary words. Carrier and
+# delay_reason are handled separately below, because they aren't words.
 TEXT_COLUMNS = {
     "warehouses": ["name", "region", "city", "state"],
     "orders": ["product_category"],
-    "shipments": ["carrier"],
+    "shipments": [],
+}
+
+# Carrier names are brands, not sentences: .str.title() turns UPS into 'Ups'
+# and FedEx into 'Fedex'. No casing rule gets these right, so the cleaned
+# lowercase form is looked up instead. Keys must be lowercase and trimmed.
+CARRIER_NAMES = {
+    "ups": "UPS",
+    "usps": "USPS",
+    "fedex": "FedEx",
+    "dhl": "DHL",
+    "ontrac": "OnTrac",
 }
 
 NUMERIC_COLUMNS = {
@@ -54,11 +68,23 @@ DATE_COLUMNS = {
     "shipments": ["ship_date", "expected_delivery_date", "actual_delivery_date"],
 }
 
+# Sentinels for values the source left blank. Real customer_ids run
+# 1000-2199, so 0 can't collide with one. These rows are still real demand
+# and are kept rather than dropped -- dropping an order would orphan its
+# shipment -- but they are NOT anonymous customers, so filter customer_id
+# on this value before counting distinct customers.
+UNKNOWN_CUSTOMER_ID = 0
+UNKNOWN_TEXT = "Unknown"
+
 FILL_VALUES = {
     "warehouses": {},
-    "orders": {"product_category": "Unknown", "customer_id": 0},
-    "shipments": {"carrier": "Unknown"},
+    "orders": {"product_category": UNKNOWN_TEXT, "customer_id": UNKNOWN_CUSTOMER_ID},
+    "shipments": {"carrier": UNKNOWN_TEXT},
 }
+
+# Not in FILL_VALUES: this one depends on on_time, which doesn't exist until
+# after the derived columns are built. Filled at the end of transform().
+UNKNOWN_DELAY_REASON = "unknown"
 
 # The four formats actually present in the raw files, confirmed by counting
 # shapes across all 20,000 date values. Tried in this order; first hit wins.
@@ -198,24 +224,54 @@ def parse_date_columns(df, table):
     return out, failed
 
 
+def tidy(series):
+    """Collapse whitespace runs and tabs, trim, blanks to NA."""
+    return (series.str.replace(r"\s+", " ", regex=True)
+                  .str.strip()
+                  .replace("", pd.NA))
+
+
+def canonical_carrier(series):
+    """
+    Map every spelling of a carrier onto its real brand name.
+
+    A lookup rather than a casing rule, because no rule produces UPS, FedEx
+    and OnTrac from the same input. Anything not in the table keeps a
+    title-cased version of itself -- an unrecognised carrier should look
+    odd in the output, not vanish into the 'Unknown' sentinel.
+    """
+    cleaned = tidy(series).str.lower()
+    mapped = cleaned.map(CARRIER_NAMES).astype("string")
+
+    unmapped = cleaned.notna() & mapped.isna()
+    if unmapped.any():
+        names = sorted(cleaned[unmapped].unique())
+        log.warning("  carrier: %d rows in %d unrecognized spellings kept as-is: %s",
+                    int(unmapped.sum()), len(names), ", ".join(names[:5]))
+        mapped = mapped.where(~unmapped, cleaned.str.title())
+    return mapped
+
+
 def normalize_text(df, table):
     """
     Trim, collapse internal runs of whitespace and tabs, and fold case.
 
     This is the step the dedup depends on: ' FEDEX' and 'FedEx ' are one
     carrier, and rows differing only by that should collapse together.
+
+    Casing is per column, not per table. Ordinary words get title case;
+    carrier gets a brand lookup; delay_reason gets lowercased to match the
+    schema's CHECK. Nothing runs after these, so nothing re-mangles them.
     """
     out = df.copy()
     for col in TEXT_COLUMNS[table]:
-        out[col] = (out[col].str.replace(r"\s+", " ", regex=True)
-                            .str.strip()
-                            .str.title())
+        out[col] = tidy(out[col]).str.title()
+
     if table == "shipments":
+        out["carrier"] = canonical_carrier(out["carrier"])
         # A fixed vocabulary the schema checks against, so lowercase rather
         # than title case.
-        out["delay_reason"] = (out["delay_reason"]
-                               .str.replace(r"\s+", " ", regex=True)
-                               .str.strip().str.lower())
+        out["delay_reason"] = tidy(out["delay_reason"]).str.lower()
     return out
 
 
@@ -331,6 +387,26 @@ def transform(frames, rejects):
              int((days < 0).sum()), int((days == 0).sum()),
              int((days > 0).sum()), int(days.isna().sum()))
 
+    # A late shipment nobody explained is not the same fact as one that
+    # arrived on time, but a blank delay_reason says both. Give the first
+    # its own value so NULL is left meaning only "not late".
+    #
+    # This has to run after on_time exists, which is why it isn't in
+    # fill_missing with the other sentinels -- those only need the raw row.
+    #
+    # on_time is nullable, so fillna(False) keeps in-transit rows (NA) out
+    # of the mask rather than letting them fall through as late.
+    unexplained = ((shipments["on_time"] == 0).fillna(False)
+                   & shipments["delay_reason"].isna())
+    n = int(unexplained.sum())
+    if n:
+        shipments.loc[unexplained, "delay_reason"] = UNKNOWN_DELAY_REASON
+        log.info("  filled %d late shipments with no recorded reason -> '%s'",
+                 n, UNKNOWN_DELAY_REASON)
+    log.info("  delay_reason: %d set, %d null (on time or in transit)",
+             int(shipments["delay_reason"].notna().sum()),
+             int(shipments["delay_reason"].isna().sum()))
+
     return frames
 
 
@@ -358,16 +434,76 @@ def connect():
     return conn
 
 
+class SchemaDriftError(RuntimeError):
+    """schema.sql no longer matches the schema the database was built with."""
+
+
+def schema_fingerprint():
+    """
+    A number identifying the current contents of schema.sql.
+
+    Hashed rather than hand-maintained: a version number you have to
+    remember to bump fails in exactly the situation this guards against.
+    Truncated to 31 bits because that is what PRAGMA user_version holds,
+    and shifted off 0 because 0 is how SQLite says "never set".
+    """
+    digest = hashlib.sha256(SCHEMA_PATH.read_bytes()).digest()
+    return (int.from_bytes(digest[:4], "big") & 0x7FFFFFFF) or 1
+
+
 def ensure_schema(conn):
-    """Build the tables the first time; leave them alone after that."""
+    """
+    Build the tables the first time, and refuse to load into a stale one.
+
+    The database carries a fingerprint of the schema.sql that built it, in
+    PRAGMA user_version. If the file has changed since, the tables in the
+    database are the old ones -- constraints added to the file wouldn't be
+    enforced and columns added to it wouldn't exist -- so this stops rather
+    than loading into a definition nobody meant to use.
+
+    It never deletes anything. Rebuilding is the caller's call.
+    """
     existing = {r[0] for r in conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table'")}
     missing = [t for t in LOAD_ORDER if t not in existing]
+    fingerprint = schema_fingerprint()
+
     if missing:
         conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
-        log.info("  created schema from %s", SCHEMA_PATH.name)
-    else:
-        log.info("  schema already present, reusing it")
+        # PRAGMA won't take a bound parameter, and this is an int we just
+        # computed, so interpolating it is safe.
+        conn.execute(f"PRAGMA user_version = {fingerprint}")
+        log.info("  created schema from %s (fingerprint %d)",
+                 SCHEMA_PATH.name, fingerprint)
+        return
+
+    stored = conn.execute("PRAGMA user_version").fetchone()[0]
+
+    if stored == 0:
+        raise SchemaDriftError(
+            f"{DB_PATH} was built before schema drift detection existed, so "
+            f"there is no way to tell whether it matches {SCHEMA_PATH.name}.\n\n"
+            + _rebuild_instructions())
+
+    if stored != fingerprint:
+        raise SchemaDriftError(
+            f"{SCHEMA_PATH.name} has changed since {DB_PATH.name} was built "
+            f"(database fingerprint {stored}, schema.sql now {fingerprint}).\n\n"
+            f"The database still holds the old table definitions. Loading now "
+            f"would write against a schema you have already edited: new "
+            f"constraints would go unenforced, new columns would be missing.\n\n"
+            + _rebuild_instructions())
+
+    log.info("  schema matches %s (fingerprint %d)", SCHEMA_PATH.name, fingerprint)
+
+
+def _rebuild_instructions():
+    return (
+        "This pipeline is a full refresh from data\\raw\\, so rebuilding "
+        "loses nothing. Delete the database and run again:\n\n"
+        "    del data\\processed\\logistics.db\n"
+        "    venv\\Scripts\\python.exe src\\etl.py\n\n"
+        "Nothing has been deleted for you -- that call is yours.")
 
 
 def row_counts(conn):
@@ -486,7 +622,13 @@ def main():
     rejects = Rejects()
     frames = extract()
     frames = transform(frames, rejects)
-    load(frames, rejects)
+    try:
+        load(frames, rejects)
+    except SchemaDriftError as e:
+        # A traceback would bury the instructions. This one is a decision
+        # for the operator, not a crash to debug.
+        log.error("SCHEMA DRIFT -- nothing was loaded\n\n%s\n", e)
+        raise SystemExit(2)
     log.info("done")
 
 

@@ -14,3 +14,4 @@ __pycache__/
 # Raw data (folder is tracked, contents are not)
 data/raw/*
 !data/raw/.gitkeep
+data/processed/rejected_rows.csv
