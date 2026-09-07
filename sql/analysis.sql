@@ -15,12 +15,14 @@
    INTEGER columns truncates to 0. Writing `100.0 *` at the front happens to
    work too, but only because evaluation runs left to right; move it to the
    end and the query silently returns 0.0. The CAST doesn't care where it
-   sits. NULLIF turns a zero denominator into NULL, so a warehouse with no
-   shipments reads as "no data" rather than a bogus number.
+   sits. NULLIF turns a zero denominator into NULL.
 
-   The joins from warehouses are LEFT so a site with zero shipments still
-   appears. That also means counting s.shipment_id rather than *, since
-   count(*) would count the empty row as one.
+   Counts of nothing are 0. Rates over nothing stay NULL, because 0% and
+   "no shipments to judge" are different claims and a 0 would rank a quiet
+   warehouse as the worst performer. run_analysis.py prints those as
+   'no data'.
+
+   Every join below says whether it's inner or outer and why.
 
    run_analysis.py splits this file on the `-- name:` lines, so keep that
    format if you add a query.
@@ -39,6 +41,10 @@ SELECT
     round(100.0 * CAST(sum(s.on_time) AS REAL)
           / NULLIF(count(s.on_time), 0), 1)       AS on_time_pct
 FROM warehouses w
+-- OUTER: the question is about every warehouse, so a site that shipped
+-- nothing is an answer ("zero"), not a row to drop. Counting
+-- s.shipment_id rather than * matters here -- count(*) would score the
+-- empty outer row as 1.
 LEFT JOIN orders    o ON o.warehouse_id = w.warehouse_id
 LEFT JOIN shipments s ON s.order_id     = o.order_id
 GROUP BY w.warehouse_id, w.name, w.region
@@ -52,13 +58,15 @@ SELECT
     w.region                                                      AS region,
     count(s.days_late)                                            AS delivered,
     -- NULL > 0 is NULL, so undelivered rows drop out of the sum on their own
-    sum(s.days_late > 0)                                          AS late,
+    coalesce(sum(s.days_late > 0), 0)                             AS late,
     round(100.0 * CAST(sum(s.days_late > 0) AS REAL)
           / NULLIF(count(s.days_late), 0), 1)                     AS late_pct,
     round(avg(s.days_late), 2)                                    AS avg_net_days,
     round(avg(CASE WHEN s.days_late > 0 THEN s.days_late END), 2) AS avg_when_late,
     max(s.days_late)                                              AS worst_days
 FROM warehouses w
+-- OUTER: same reasoning as above. A region whose warehouses have delivered
+-- nothing yet should read as empty rather than disappear from the report.
 LEFT JOIN orders    o ON o.warehouse_id = w.warehouse_id
 LEFT JOIN shipments s ON s.order_id     = o.order_id
 GROUP BY w.region
@@ -70,15 +78,15 @@ ORDER BY avg_when_late DESC;
 -- question: What goes wrong most often at each site? A shortage problem needs a different fix than a weather one.
 WITH reason_counts AS (
     SELECT
-        w.warehouse_id                AS warehouse_id,
-        w.name                        AS warehouse,
-        s.delay_reason                AS delay_reason,
-        count(*)                      AS occurrences
+        o.warehouse_id  AS warehouse_id,
+        s.delay_reason  AS delay_reason,
+        count(*)        AS occurrences
     FROM shipments s
-    JOIN orders     o ON o.order_id     = s.order_id
-    JOIN warehouses w ON w.warehouse_id = o.warehouse_id
+    -- INNER: this block counts delays that actually happened. A shipment
+    -- with no delay_reason has nothing to contribute to a tally of reasons.
+    JOIN orders o ON o.order_id = s.order_id
     WHERE s.delay_reason IS NOT NULL
-    GROUP BY w.warehouse_id, w.name, s.delay_reason
+    GROUP BY o.warehouse_id, s.delay_reason
 ),
 ranked AS (
     SELECT
@@ -90,16 +98,20 @@ ranked AS (
     FROM reason_counts
 )
 SELECT
-    warehouse                                     AS warehouse,
-    delay_reason                                  AS top_reason,
-    occurrences                                   AS occurrences,
-    all_delays                                    AS total_delays,
+    w.name                                          AS warehouse,
+    coalesce(r.delay_reason, 'no delays recorded')  AS top_reason,
+    coalesce(r.occurrences, 0)                      AS occurrences,
+    coalesce(r.all_delays, 0)                       AS total_delays,
     -- two integer columns divided directly: the CAST is doing real work here
-    round(100.0 * CAST(occurrences AS REAL)
-          / NULLIF(all_delays, 0), 1)             AS share_pct
-FROM ranked
-WHERE rank_in_warehouse = 1
-ORDER BY occurrences DESC;
+    round(100.0 * CAST(r.occurrences AS REAL)
+          / NULLIF(r.all_delays, 0), 1)             AS share_pct
+FROM warehouses w
+-- OUTER: a warehouse with a clean record is a result worth seeing. Inner
+-- would silently hide the best-performing sites, which is the opposite of
+-- what this report is for.
+LEFT JOIN ranked r ON r.warehouse_id = w.warehouse_id
+                  AND r.rank_in_warehouse = 1
+ORDER BY occurrences DESC, warehouse;
 
 
 -- name: carrier_ranking
@@ -110,9 +122,13 @@ SELECT
     count(s.on_time)                                              AS delivered,
     round(100.0 * CAST(sum(s.on_time) AS REAL)
           / NULLIF(count(s.on_time), 0), 1)                       AS on_time_pct,
-    sum(s.on_time = 0)                                            AS late,
+    coalesce(sum(s.on_time = 0), 0)                               AS late,
     round(avg(CASE WHEN s.days_late > 0 THEN s.days_late END), 2) AS avg_when_late,
     max(s.days_late)                                              AS worst_days
+-- NO JOIN: carrier is a column on shipments, not a table. There is no
+-- carrier dimension to outer-join against, so a carrier with zero shipments
+-- cannot exist in this schema. Add a carriers table and this becomes a LEFT
+-- JOIN like the others.
 FROM shipments s
 WHERE s.carrier <> 'Unknown'   -- placeholder, not a carrier
 GROUP BY s.carrier
@@ -132,7 +148,9 @@ SELECT
     round(100.0 * CAST(sum(s.on_time) AS REAL)
           / NULLIF(count(s.on_time), 0), 1)     AS on_time_pct
 FROM orders o
--- LEFT JOIN: an order with no shipment is still demand
+-- OUTER: an order that hasn't been shipped yet is still demand and still
+-- belongs in the month's volume. Inner would quietly understate recent
+-- months, which is exactly where the unshipped orders are.
 LEFT JOIN shipments s ON s.order_id = o.order_id
 GROUP BY month
 ORDER BY month;
@@ -150,6 +168,10 @@ SELECT
           / NULLIF(count(s.on_time), 0), 1)                       AS late_pct,
     round(avg(CASE WHEN s.days_late > 0 THEN s.days_late END), 2) AS avg_when_late
 FROM shipments s
+-- INNER, deliberately: the row here is a warehouse/carrier pairing that
+-- actually shipped. Outer would invent rows for the 40-odd pairings that
+-- never happened, and a ranking of combinations with no shipments is noise.
+-- Dropping unmatched rows IS the filter.
 JOIN orders     o ON o.order_id     = s.order_id
 JOIN warehouses w ON w.warehouse_id = o.warehouse_id
 WHERE s.carrier <> 'Unknown'

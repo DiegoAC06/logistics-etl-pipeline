@@ -107,6 +107,13 @@ def render(headers, rows):
 
     numeric = [is_numeric([r[i] for r in rows]) for i in range(len(headers))]
     cells = [[fmt_value(v) for v in row] for row in rows]
+
+    # A NULL rate means there was nothing to measure, not 0%. Say so, rather
+    # than printing a dash that reads like a missing value.
+    if pct_idx is not None:
+        for cell_row, source in zip(cells, rows):
+            if source[pct_idx] is None:
+                cell_row[pct_idx] = "no data"
     widths = [max(len(h), *(len(row[i]) for row in cells))
               for i, h in enumerate(headers)]
 
