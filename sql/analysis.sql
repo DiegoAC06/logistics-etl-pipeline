@@ -2,7 +2,11 @@
    Analysis queries for logistics.db.  Run: python src\run_analysis.py
 
    Populations. Almost every mistake in this file would be an aggregate run
-   over the wrong one, so each query's comment names its own:
+   over the wrong one, so each query's comment names its own.
+
+   The counts below are AS OF THE SEEDED DATASET (generate_data.py with
+   SEED=42). They are here to show the shape of the data, not as facts to
+   rely on -- regenerate with a different seed and every one of them moves.
 
      all shipments      5000
        delivered        4945   days_late IS NOT NULL
@@ -140,7 +144,7 @@ ORDER BY occurrences DESC, warehouse;
 
 -- name: carrier_ranking
 -- title: Carrier performance ranking
--- question: Which carriers earn their money? delivered, on_time_pct and avg_net_days are over that carrier's delivered shipments; avg_when_late is over its late ones only. The gap between the two averages is how concentrated the pain is. RECONCILES: delivered sums to every delivered shipment (4,909 across the five real carriers + 36 in the 'Unknown' bucket = 4,945).
+-- question: Which carriers earn their money? delivered, on_time_pct and avg_net_days are over that carrier's delivered shipments; avg_when_late is over its late ones only. The gap between the two averages is how concentrated the pain is. RECONCILES: the delivered column sums to every delivered shipment, real carriers plus the 'Unknown' bucket, whatever the dataset.
 SELECT
     s.carrier                                                     AS carrier,
     count(s.on_time)                                              AS delivered,
@@ -156,8 +160,9 @@ SELECT
 -- JOIN like the others.
 FROM shipments s
 -- 'Unknown' is NOT filtered out here, on purpose. It used to be, and the
--- delivered column then summed to 4,909 with nothing on screen explaining
--- the missing 36 -- a silent hole is worse than a labelled bucket. It is
+-- delivered column then came up short of the table's total with nothing on
+-- screen explaining the shortfall -- a silent hole is worse than a labelled
+-- bucket, however small the bucket happens to be today. It is
 -- still not a carrier (it's shipments whose carrier was blank at source),
 -- so it's pinned to the bottom instead of being ranked among the real ones.
 -- Exclude it explicitly when comparing carriers against each other.
@@ -206,7 +211,11 @@ FROM shipments s
 JOIN orders     o ON o.order_id     = s.order_id
 JOIN warehouses w ON w.warehouse_id = o.warehouse_id
 -- excluded here but NOT in query 4: a warehouse/'Unknown' pairing isn't a
--- real relationship to rank, and this list never reconciles anyway
+-- real relationship to rank, and this list never reconciles anyway.
+--
+-- COUPLED TO src\etl.py: 'Unknown' is UNKNOWN_CARRIER there. Rename it in
+-- one place only and this filter matches nothing -- and matching nothing
+-- is not an error, so it fails quietly. Query 4's ORDER BY has the same tie.
 WHERE s.carrier <> 'Unknown'
 GROUP BY w.warehouse_id, w.name, s.carrier
 -- below 30 delivered it's luck, not performance
@@ -217,7 +226,7 @@ LIMIT 15;
 
 -- name: delay_reason_frequency
 -- title: Delay reasons by frequency
--- question: Across the whole network, what actually causes delays? Counts are over the 1,009 late shipments and every one carries a reason, so shipments sums to that and share_pct sums to 100%. 'unknown' is not a cause -- it's the bucket for late shipments where nobody recorded one.
+-- question: Across the whole network, what actually causes delays? Counts are over every late shipment, and the ETL gives all of them a reason, so shipments sums to the late total and share_pct sums to 100%. 'unknown' is not a cause -- it's the bucket for late shipments where nobody recorded one.
 SELECT
     s.delay_reason                                    AS delay_reason,
     count(*)                                          AS shipments,

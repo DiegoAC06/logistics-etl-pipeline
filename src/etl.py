@@ -94,6 +94,10 @@ DATE_COLUMNS = {
 UNKNOWN_CUSTOMER_ID = 0
 # Each sentinel matches its own column's convention: carriers are brand
 # names, categories are lowercase keys.
+#
+# COUPLED TO sql\analysis.sql: query 6 filters on the literal 'Unknown' and
+# query 4 sorts on it. Change this value and those queries stop matching --
+# silently, since a filter that matches nothing is not an error.
 UNKNOWN_CARRIER = "Unknown"
 UNKNOWN_CATEGORY = "unknown"
 
@@ -121,6 +125,21 @@ DATE_FORMATS = ["%Y-%m-%d", "%m/%d/%Y", "%Y/%m/%d", "%d-%b-%Y"]
 REQUIRED_DATES = {
     "orders": ["order_date"],
     "shipments": ["ship_date", "expected_delivery_date"],
+}
+
+# Numeric columns that must actually be numbers. customer_id is absent on
+# purpose -- it has a sentinel, so an unparseable one becomes UNKNOWN_CUSTOMER_ID
+# rather than a rejected row.
+REQUIRED_NUMERICS = {
+    "warehouses": ["warehouse_id"],
+    "orders": ["order_id", "warehouse_id", "quantity"],
+    "shipments": ["shipment_id", "order_id"],
+}
+
+PRIMARY_KEYS = {
+    "warehouses": "warehouse_id",
+    "orders": "order_id",
+    "shipments": "shipment_id",
 }
 
 
@@ -317,6 +336,116 @@ def fill_missing(df, table):
     return out
 
 
+def key_text(series):
+    """
+    Render an id for a reject reason.
+
+    to_numeric gives float64 as soon as one value in the column is NaN, so
+    a plain astype(str) writes 'order_id=13.0' into the reason column.
+    """
+    # astype at the end matters: map over an empty selection keeps the
+    # numeric dtype, and "id=" + <empty int64 series> raises. These details
+    # are built before rejects.add sees the frame is empty, so the common
+    # case -- nothing rejected -- goes through here too.
+    return series.map(
+        lambda v: "" if pd.isna(v)
+        else str(int(v)) if float(v).is_integer() else str(v)
+    ).astype("string")
+
+
+def validate_numerics(frames, rejects):
+    """
+    Reject rows whose required numeric columns didn't parse.
+
+    coerce_numerics uses errors='coerce', so 'abc' in order_id becomes NaN
+    and then None on insert. SQLite reads NULL in an INTEGER PRIMARY KEY as
+    "pick a rowid for me", so the row would load under a fabricated key
+    instead of failing -- silent corruption rather than a loud abort.
+
+    customer_id is deliberately not required: it has a sentinel, and
+    fill_missing turns its NaN into UNKNOWN_CUSTOMER_ID a step later.
+    """
+    for name in LOAD_ORDER:
+        df = frames[name]
+        before = len(df)
+        cols = REQUIRED_NUMERICS[name]
+        bad = df[cols].isna().any(axis=1)
+        if bad.any():
+            which = df.loc[bad, cols].isna().apply(
+                lambda r: "not numeric: " + ", ".join(r.index[r]), axis=1)
+            rejects.add(name, df[bad], "required numeric column unparseable", which)
+            df = df[~bad].copy()
+        log_step(name, "reject unparseable numbers", before, len(df))
+        frames[name] = df
+    return frames
+
+
+def validate_primary_keys(frames, rejects):
+    """
+    Reject rows that repeat a primary key with different values.
+
+    drop_duplicates has already removed identical rows, so anything left
+    sharing a key genuinely disagrees with its twin. Both would insert and
+    the second would abort the transaction with "UNIQUE constraint failed"
+    naming no row at all.
+
+    THE FIRST ROW WINS. Source order is the only ordering available -- there
+    is no updated_at to prefer -- so first-seen is at least deterministic.
+    Rejecting every copy instead would be more cautious about which one is
+    true, but it would also delete the key entirely and orphan any child
+    rows pointing at it, turning one bad row into several.
+    """
+    for name, key in PRIMARY_KEYS.items():
+        df = frames[name]
+        before = len(df)
+        conflicting = df.duplicated(subset=[key], keep="first")
+        if conflicting.any():
+            detail = (f"{key}=" + key_text(df.loc[conflicting, key])
+                      + " already seen with different values")
+            rejects.add(name, df[conflicting],
+                        "duplicate primary key with conflicting values", detail)
+            df = df[~conflicting].copy()
+        log_step(name, "reject conflicting keys", before, len(df))
+        frames[name] = df
+    return frames
+
+
+def validate_ranges(frames, rejects):
+    """
+    Reject rows that break the schema's CHECK constraints on values.
+
+    Both rules are already declared in schema.sql. Catching them here is the
+    difference between a labelled row in rejected_rows.csv and a transaction
+    that aborts naming a constraint but no row.
+    """
+    orders = frames["orders"]
+    shipments = frames["shipments"]
+
+    before = len(orders)
+    bad = orders["quantity"] <= 0
+    if bad.any():
+        rejects.add("orders", orders[bad], "quantity is not positive",
+                    "quantity=" + key_text(orders.loc[bad, "quantity"]))
+        orders = orders[~bad].copy()
+    log_step("orders", "reject non-positive qty", before, len(orders))
+
+    before = len(shipments)
+    bad = shipments["expected_delivery_date"] < shipments["ship_date"]
+    if bad.any():
+        detail = ("expected "
+                  + shipments.loc[bad, "expected_delivery_date"].dt.strftime("%Y-%m-%d")
+                  + " < ship "
+                  + shipments.loc[bad, "ship_date"].dt.strftime("%Y-%m-%d"))
+        rejects.add("shipments", shipments[bad],
+                    "expected_delivery_date before ship_date", detail)
+        shipments = shipments[~bad].copy()
+    log_step("shipments", "reject expected<ship", before, len(shipments))
+
+    frames["orders"] = orders
+    frames["shipments"] = shipments
+    return frames
+
+
 def validate_dates(frames, rejects):
     """
     Pull out rows whose dates can't be trusted.
@@ -398,7 +527,12 @@ def transform(frames, rejects):
     log.info("  %d date values failed to parse across all columns", total_failed)
 
     log.info("  -- validation --")
+    # Numbers first: everything after this depends on the ids being real.
+    # Then keys, then dates, then value ranges.
+    frames = validate_numerics(frames, rejects)
+    frames = validate_primary_keys(frames, rejects)
     frames = validate_dates(frames, rejects)
+    frames = validate_ranges(frames, rejects)
     shipments = frames["shipments"]
 
     # Delivery performance, computed only on rows whose dates survived
@@ -463,6 +597,10 @@ def connect():
 
 class SchemaDriftError(RuntimeError):
     """schema.sql no longer matches the schema the database was built with."""
+
+
+class ForeignKeyViolation(RuntimeError):
+    """The loaded rows break a foreign key. Fails the run; nothing commits."""
 
 
 def schema_fingerprint():
@@ -587,7 +725,7 @@ def load(frames, rejects):
     orders, bad_orders = split_on_fk(
         orders, "warehouse_id", set(warehouses["warehouse_id"]))
     rejects.add("orders", bad_orders, "warehouse_id not found in warehouses",
-                "warehouse_id=" + bad_orders["warehouse_id"].astype(str))
+                "warehouse_id=" + key_text(bad_orders["warehouse_id"]))
     log_step("orders", "reject orphan warehouse_id", before, len(orders))
 
     # Checked against the orders that survived, not the ones we started with
@@ -596,7 +734,7 @@ def load(frames, rejects):
     shipments, bad_shipments = split_on_fk(
         shipments, "order_id", set(orders["order_id"]))
     rejects.add("shipments", bad_shipments, "order_id not found in orders",
-                "order_id=" + bad_shipments["order_id"].astype(str))
+                "order_id=" + key_text(bad_shipments["order_id"]))
     log_step("shipments", "reject orphan order_id", before, len(shipments))
 
     rejects.write()
@@ -624,6 +762,16 @@ def load(frames, rejects):
                 insert_frame(conn, table, staged[table])
                 log.info("  inserted %-12s %5d rows", table, len(staged[table]))
 
+            # Checked before COMMIT, not after. Run after and a violation is
+            # already durable, so failing the run would just leave a broken
+            # database behind; here it rolls back with everything else.
+            violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+            if violations:
+                raise ForeignKeyViolation(
+                    f"{len(violations)} foreign key violation(s) after load, "
+                    f"first few: {violations[:5]}")
+            log.info("  foreign key check clean")
+
             conn.execute("COMMIT")
         except Exception:
             conn.execute("ROLLBACK")
@@ -631,12 +779,6 @@ def load(frames, rejects):
             raise
 
         log.info("  rows after load:   %s", fmt_counts(row_counts(conn)))
-
-        violations = conn.execute("PRAGMA foreign_key_check").fetchall()
-        if violations:
-            log.error("  %d foreign key violations after load", len(violations))
-        else:
-            log.info("  foreign key check clean")
     finally:
         conn.close()
 
