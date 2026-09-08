@@ -213,3 +213,22 @@ GROUP BY w.warehouse_id, w.name, s.carrier
 HAVING count(s.on_time) >= 30
 ORDER BY late_pct DESC
 LIMIT 15;
+
+
+-- name: delay_reason_frequency
+-- title: Delay reasons by frequency
+-- question: Across the whole network, what actually causes delays? Counts are over the 1,009 late shipments and every one carries a reason, so shipments sums to that and share_pct sums to 100%. 'unknown' is not a cause -- it's the bucket for late shipments where nobody recorded one.
+SELECT
+    s.delay_reason                                    AS delay_reason,
+    count(*)                                          AS shipments,
+    round(100.0 * CAST(count(*) AS REAL)
+          / NULLIF((SELECT count(*) FROM shipments
+                    WHERE days_late > 0), 0), 1)      AS share_pct,
+    round(avg(s.days_late), 2)                        AS avg_days_late,
+    max(s.days_late)                                  AS worst_days
+-- NO JOIN: everything needed is on shipments. Nothing is filtered beyond
+-- "has a reason", which after the ETL means exactly "was late".
+FROM shipments s
+WHERE s.delay_reason IS NOT NULL
+GROUP BY s.delay_reason
+ORDER BY shipments DESC;
